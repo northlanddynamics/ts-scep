@@ -1,0 +1,217 @@
+import * as nodeCrypto from "node:crypto";
+import type { KeyObject } from "node:crypto";
+import type { DigestAlgorithm, EncryptionAlgorithm } from "./constants.js";
+import { FailInfo } from "./constants.js";
+import { ScepProtocolError } from "./errors.js";
+import { OID } from "./oids.js";
+import { toBuffer, type BytesLike } from "./util.js";
+
+/** Private keys may be given as KeyObjects, PEM text or PKCS#8 DER. */
+export type PrivateKeyLike = KeyObject | string | Uint8Array;
+/** Public keys may be given as KeyObjects, PEM text or SPKI DER. */
+export type PublicKeyLike = KeyObject | string | Uint8Array;
+
+export function toPrivateKey(key: PrivateKeyLike): KeyObject {
+  if (typeof key === "string") return nodeCrypto.createPrivateKey(key);
+  if (key instanceof Uint8Array) return nodeCrypto.createPrivateKey({ key: toBuffer(key), format: "der", type: "pkcs8" });
+  if (key.type !== "private") throw new TypeError("Expected a private key");
+  return key;
+}
+
+export function toPublicKey(key: PublicKeyLike): KeyObject {
+  if (typeof key === "string") return nodeCrypto.createPublicKey(key);
+  if (key instanceof Uint8Array) return nodeCrypto.createPublicKey({ key: toBuffer(key), format: "der", type: "spki" });
+  return key.type === "private" ? nodeCrypto.createPublicKey(key) : key;
+}
+
+/** Generate an RSA key pair suitable for SCEP (RSA is required for CMS key transport). */
+export function generateRsaKeyPair(modulusLength = 2048): { publicKey: KeyObject; privateKey: KeyObject } {
+  return nodeCrypto.generateKeyPairSync("rsa", { modulusLength, publicExponent: 0x10001 });
+}
+
+// ---------------------------------------------------------------------------
+// Digests and signatures
+// ---------------------------------------------------------------------------
+
+export const DIGEST_OIDS: Record<DigestAlgorithm, string> = {
+  sha1: OID.sha1,
+  sha256: OID.sha256,
+  sha384: OID.sha384,
+  sha512: OID.sha512,
+};
+
+export const RSA_SIGNATURE_OIDS: Record<DigestAlgorithm, string> = {
+  sha1: OID.sha1WithRSAEncryption,
+  sha256: OID.sha256WithRSAEncryption,
+  sha384: OID.sha384WithRSAEncryption,
+  sha512: OID.sha512WithRSAEncryption,
+};
+
+const ECDSA_SIGNATURE_OIDS: Record<string, DigestAlgorithm> = {
+  "1.2.840.10045.4.1": "sha1",
+  "1.2.840.10045.4.3.2": "sha256",
+  "1.2.840.10045.4.3.3": "sha384",
+  "1.2.840.10045.4.3.4": "sha512",
+};
+
+export function digestAlgorithmFromOid(oid: string): DigestAlgorithm {
+  for (const [name, value] of Object.entries(DIGEST_OIDS)) if (value === oid) return name as DigestAlgorithm;
+  for (const [name, value] of Object.entries(RSA_SIGNATURE_OIDS)) if (value === oid) return name as DigestAlgorithm;
+  const ec = ECDSA_SIGNATURE_OIDS[oid];
+  if (ec) return ec;
+  throw new ScepProtocolError(`Unsupported digest algorithm ${oid}`, FailInfo.badAlg);
+}
+
+/**
+ * Determine the digest used by a signature algorithm identifier, falling back to the
+ * separately-specified digest algorithm (CMS signerInfos commonly use plain rsaEncryption).
+ */
+export function signatureDigest(signatureOid: string, fallback: DigestAlgorithm): DigestAlgorithm {
+  if (signatureOid === OID.rsaEncryption) return fallback;
+  return digestAlgorithmFromOid(signatureOid);
+}
+
+export function digest(algorithm: DigestAlgorithm, data: BytesLike): Buffer {
+  return nodeCrypto.createHash(algorithm).update(toBuffer(data)).digest();
+}
+
+export function sign(algorithm: DigestAlgorithm, key: KeyObject, data: BytesLike): Buffer {
+  if (key.asymmetricKeyType === "rsa") {
+    return nodeCrypto.sign(algorithm, toBuffer(data), { key, padding: nodeCrypto.constants.RSA_PKCS1_PADDING });
+  }
+  return nodeCrypto.sign(algorithm, toBuffer(data), key);
+}
+
+export function verify(algorithm: DigestAlgorithm, key: KeyObject, data: BytesLike, signature: BytesLike): boolean {
+  try {
+    if (key.asymmetricKeyType === "rsa") {
+      return nodeCrypto.verify(
+        algorithm,
+        toBuffer(data),
+        { key, padding: nodeCrypto.constants.RSA_PKCS1_PADDING },
+        toBuffer(signature),
+      );
+    }
+    return nodeCrypto.verify(algorithm, toBuffer(data), key, toBuffer(signature));
+  } catch {
+    return false;
+  }
+}
+
+/** Signature algorithm OID for a key and digest (used for X.509 certificates, CRLs and CSRs). */
+export function signatureAlgorithmOid(key: KeyObject, algorithm: DigestAlgorithm): string {
+  if (key.asymmetricKeyType === "rsa") return RSA_SIGNATURE_OIDS[algorithm];
+  if (key.asymmetricKeyType === "ec") {
+    for (const [oid, alg] of Object.entries(ECDSA_SIGNATURE_OIDS)) if (alg === algorithm) return oid;
+  }
+  throw new ScepProtocolError(`Unsupported key type ${key.asymmetricKeyType}`, FailInfo.badAlg);
+}
+
+// ---------------------------------------------------------------------------
+// RSA key transport
+// ---------------------------------------------------------------------------
+
+export function rsaEncrypt(key: KeyObject, data: BytesLike): Buffer {
+  if (key.asymmetricKeyType !== "rsa") {
+    throw new ScepProtocolError("SCEP key transport requires an RSA recipient key", FailInfo.badAlg);
+  }
+  return nodeCrypto.publicEncrypt({ key, padding: nodeCrypto.constants.RSA_PKCS1_PADDING }, toBuffer(data));
+}
+
+/**
+ * RSAES-PKCS1-v1_5 decryption. Newer Node.js releases implement implicit rejection natively;
+ * on releases that refuse PKCS#1 v1.5 private decryption we fall back to raw RSA and unpad in
+ * constant-ish time, substituting a random key of the expected length on padding failure so
+ * that the error surfaces later as an indistinguishable content-decryption failure.
+ */
+export function rsaDecrypt(key: KeyObject, data: BytesLike, expectedLength?: number): Buffer {
+  const input = toBuffer(data);
+  try {
+    return nodeCrypto.privateDecrypt({ key, padding: nodeCrypto.constants.RSA_PKCS1_PADDING }, input);
+  } catch (err) {
+    if (!/no longer supported/i.test(String((err as Error).message))) {
+      if (expectedLength) return nodeCrypto.randomBytes(expectedLength);
+      throw new ScepProtocolError("Unable to decrypt content-encryption key", FailInfo.badMessageCheck, { cause: err });
+    }
+  }
+  const em = nodeCrypto.privateDecrypt({ key, padding: nodeCrypto.constants.RSA_NO_PADDING }, input);
+  const message = pkcs1v15Unpad(em, expectedLength);
+  if (message) return message;
+  if (expectedLength) return nodeCrypto.randomBytes(expectedLength);
+  throw new ScepProtocolError("Unable to decrypt content-encryption key", FailInfo.badMessageCheck);
+}
+
+/**
+ * Remove RSAES-PKCS1-v1_5 padding (EM = 0x00 || 0x02 || PS || 0x00 || M, |PS| >= 8) without
+ * data-dependent early exits. Returns undefined on malformed padding or unexpected length.
+ * @internal
+ */
+export function pkcs1v15Unpad(em: Buffer, expectedLength?: number): Buffer | undefined {
+  let good = (em[0] === 0x00 ? 1 : 0) & (em[1] === 0x02 ? 1 : 0);
+  let sep = 0;
+  for (let i = 2; i < em.length; i++) {
+    const isFirstZero = (em[i] === 0 ? 1 : 0) & (sep === 0 ? 1 : 0);
+    sep = isFirstZero ? i : sep;
+  }
+  good &= sep >= 10 ? 1 : 0;
+  const message = em.subarray(sep + 1);
+  if (expectedLength !== undefined) good &= message.length === expectedLength ? 1 : 0;
+  return good ? Buffer.from(message) : undefined;
+}
+
+// ---------------------------------------------------------------------------
+// Content encryption
+// ---------------------------------------------------------------------------
+
+interface CipherInfo {
+  oid: string;
+  keyLength: number;
+  ivLength: number;
+}
+
+export const CONTENT_ENCRYPTION: Record<EncryptionAlgorithm, CipherInfo> = {
+  "aes-128-cbc": { oid: OID.aes128CBC, keyLength: 16, ivLength: 16 },
+  "aes-192-cbc": { oid: OID.aes192CBC, keyLength: 24, ivLength: 16 },
+  "aes-256-cbc": { oid: OID.aes256CBC, keyLength: 32, ivLength: 16 },
+  "des-ede3-cbc": { oid: OID.desEde3CBC, keyLength: 24, ivLength: 8 },
+  "des-cbc": { oid: OID.desCBC, keyLength: 8, ivLength: 8 },
+};
+
+/**
+ * OpenSSL 3 only offers single DES through its legacy provider. Triple DES in EDE mode with
+ * K1 = K2 = K3 is exactly single DES, so map it onto des-ede3-cbc.
+ */
+function cipherParams(algorithm: EncryptionAlgorithm, key: Buffer): [string, Buffer] {
+  if (algorithm === "des-cbc") return ["des-ede3-cbc", Buffer.concat([key, key, key])];
+  return [algorithm, key];
+}
+
+export function encryptionAlgorithmFromOid(oid: string): EncryptionAlgorithm {
+  for (const [name, info] of Object.entries(CONTENT_ENCRYPTION)) if (info.oid === oid) return name as EncryptionAlgorithm;
+  throw new ScepProtocolError(`Unsupported content-encryption algorithm ${oid}`, FailInfo.badAlg);
+}
+
+export function encryptContent(
+  algorithm: EncryptionAlgorithm,
+  plaintext: BytesLike,
+): { key: Buffer; iv: Buffer; ciphertext: Buffer } {
+  const info = CONTENT_ENCRYPTION[algorithm];
+  const key = nodeCrypto.randomBytes(info.keyLength);
+  const iv = nodeCrypto.randomBytes(info.ivLength);
+  const cipher = nodeCrypto.createCipheriv(...cipherParams(algorithm, key), iv);
+  const ciphertext = Buffer.concat([cipher.update(toBuffer(plaintext)), cipher.final()]);
+  return { key, iv, ciphertext };
+}
+
+export function decryptContent(algorithm: EncryptionAlgorithm, key: BytesLike, iv: BytesLike, ciphertext: BytesLike): Buffer {
+  try {
+    const decipher = nodeCrypto.createDecipheriv(...cipherParams(algorithm, toBuffer(key)), toBuffer(iv));
+    return Buffer.concat([decipher.update(toBuffer(ciphertext)), decipher.final()]);
+  } catch (err) {
+    throw new ScepProtocolError("Unable to decrypt pkcsPKIEnvelope", FailInfo.badMessageCheck, { cause: err });
+  }
+}
+
+export function randomBytes(length: number): Buffer {
+  return nodeCrypto.randomBytes(length);
+}

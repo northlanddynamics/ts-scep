@@ -1,0 +1,53 @@
+{
+  "name": "ts-scep",
+  "version": "0.1.0",
+  "description": "TypeScript SDK for the Simple Certificate Enrolment Protocol (SCEP, RFC 8894) — client and server",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "scep",
+    "rfc8894",
+    "pki",
+    "pkcs7",
+    "cms",
+    "certificate",
+    "enrollment",
+    "x509"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "prepublishOnly": "npm run build",
+    "example": "tsx examples/server.ts"
+  },
+  "dependencies": {
+    "@peculiar/asn1-cms": "^2.10.0",
+    "@peculiar/asn1-csr": "^2.10.0",
+    "@peculiar/asn1-pkcs9": "^2.10.0",
+    "@peculiar/asn1-rsa": "^2.10.0",
+    "@peculiar/asn1-schema": "^2.10.0",
+    "@peculiar/asn1-x509": "^2.10.0",
+    "asn1js": "^3.0.10"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4"
+  }
+}

@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [20, 22, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+      - run: npm test
+
+  interop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: Build sscep
+        run: |
+          sudo apt-get update && sudo apt-get install -y libssl-dev cmake
+          git clone --depth 1 https://github.com/certnanny/sscep.git "$RUNNER_TEMP/sscep"
+          cmake -S "$RUNNER_TEMP/sscep" -B "$RUNNER_TEMP/sscep-build" -DCMAKE_BUILD_TYPE=Release
+          cmake --build "$RUNNER_TEMP/sscep-build" -j
+      - name: Build micromdm scepserver
+        run: |
+          git clone --depth 1 https://github.com/micromdm/scep.git "$RUNNER_TEMP/micromdm-scep"
+          (cd "$RUNNER_TEMP/micromdm-scep" && go build -o "$RUNNER_TEMP/scepserver" ./cmd/scepserver)
+      - run: npm ci
+      - run: npm test
+        env:
+          SSCEP_BIN: ${{ runner.temp }}/sscep-build/sscep
+          SCEPSERVER_BIN: ${{ runner.temp }}/scepserver
