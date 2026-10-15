@@ -17,6 +17,9 @@ export const OID = {
 
   // Public key / signature algorithms
   rsaEncryption: "1.2.840.113549.1.1.1",
+  rsaesOaep: "1.2.840.113549.1.1.7",
+  mgf1: "1.2.840.113549.1.1.8",
+  pSpecified: "1.2.840.113549.1.1.9",
   sha1WithRSAEncryption: "1.2.840.113549.1.1.5",
   sha256WithRSAEncryption: "1.2.840.113549.1.1.11",
   sha384WithRSAEncryption: "1.2.840.113549.1.1.12",

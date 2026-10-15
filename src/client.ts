@@ -13,6 +13,7 @@ import {
   PkiStatus,
   type DigestAlgorithm,
   type EncryptionAlgorithm,
+  type KeyTransportAlgorithm,
 } from "./constants.js";
 import { randomBytes, toPrivateKey, type PrivateKeyLike } from "./crypto.js";
 import { ScepError, ScepFailureError, ScepHttpError, ScepProtocolError } from "./errors.js";
@@ -61,6 +62,11 @@ export interface ScepClientOptions {
   digestAlgorithm?: DigestAlgorithm;
   /** Override the negotiated content-encryption algorithm. */
   encryptionAlgorithm?: EncryptionAlgorithm;
+  /**
+   * Key-transport scheme for request envelopes (default `rsa-pkcs1`). RFC 8894 defines no
+   * capability keyword for RSAES-OAEP, so only enable it for CAs known to accept it.
+   */
+  keyTransport?: KeyTransportAlgorithm;
   /** Force (true) or forbid (false) HTTP POST for PKIOperation. Negotiated from capabilities by default. */
   usePost?: boolean;
   /** Extra HTTP headers on every request. */
@@ -368,6 +374,7 @@ export class ScepClient {
       signer: identity,
       digestAlgorithm: this.digestFor(caps),
       encryptionAlgorithm: this.options.encryptionAlgorithm ?? caps.encryptionAlgorithm,
+      keyTransport: this.options.keyTransport,
     });
     const raw = await this.pkiOperation(request, this.options.usePost ?? caps.supportsPost);
     const response = decodePkiMessage(raw, { recipient: identity, signerCertificates: ca.all });

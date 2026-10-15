@@ -6,8 +6,8 @@ import type { KeyObject, X509Certificate } from "node:crypto";
 import { AsnConvert, OctetString } from "@peculiar/asn1-schema";
 import * as cms from "@peculiar/asn1-cms";
 import { AlgorithmIdentifier } from "@peculiar/asn1-x509";
-import { AnySet, ScepSignedData, objectIdentifier, octetString, readObjectIdentifier, parse, readOctetString, serialize, sortDerSet } from "./asn1.js";
-import type { DigestAlgorithm, EncryptionAlgorithm } from "./constants.js";
+import { AnySet, OaepParams, ScepSignedData, objectIdentifier, octetString, readObjectIdentifier, parse, readOctetString, serialize, sortDerSet } from "./asn1.js";
+import type { DigestAlgorithm, EncryptionAlgorithm, KeyTransportAlgorithm } from "./constants.js";
 import { FailInfo } from "./constants.js";
 import {
   CONTENT_ENCRYPTION,
@@ -17,8 +17,10 @@ import {
   digestAlgorithmFromOid,
   encryptContent,
   encryptionAlgorithmFromOid,
+  resolveKeyTransport,
   rsaDecrypt,
   rsaEncrypt,
+  type ResolvedKeyTransport,
   sign,
   signatureDigest,
   verify,
@@ -281,18 +283,89 @@ export function verifySignerInfo(
 // EnvelopedData
 // ---------------------------------------------------------------------------
 
+/**
+ * Hash AlgorithmIdentifier inside RSAES-OAEP-params. SHA-1 keeps NULL parameters to match the
+ * ASN.1 DEFAULT value (so it is omitted under DER); other hashes omit them (RFC 4055 §2.1).
+ */
+function oaepHashIdentifier(hash: DigestAlgorithm): AlgorithmIdentifier {
+  return algorithmIdentifier(DIGEST_OIDS[hash], hash === "sha1");
+}
+
+/** keyEncryptionAlgorithm for a KeyTransRecipientInfo. */
+function keyEncryptionAlgorithmIdentifier(kt: ResolvedKeyTransport): AlgorithmIdentifier {
+  if (kt.scheme === "rsa-pkcs1") return algorithmIdentifier(OID.rsaEncryption);
+  const params = new OaepParams();
+  if (kt.hash !== "sha1") {
+    params.hashAlgorithm = oaepHashIdentifier(kt.hash);
+    params.maskGenAlgorithm = new AlgorithmIdentifier({ algorithm: OID.mgf1, parameters: AsnConvert.serialize(oaepHashIdentifier(kt.hash)) });
+  }
+  if (kt.label.length) {
+    params.pSourceAlgorithm = new AlgorithmIdentifier({ algorithm: OID.pSpecified, parameters: octetString(kt.label) });
+  }
+  return new AlgorithmIdentifier({ algorithm: OID.rsaesOaep, parameters: AsnConvert.serialize(params) });
+}
+
+function oaepHashFromIdentifier(id: AlgorithmIdentifier): DigestAlgorithm {
+  const hash = (Object.keys(DIGEST_OIDS) as DigestAlgorithm[]).find((h) => DIGEST_OIDS[h] === id.algorithm);
+  if (!hash) throw new ScepProtocolError(`Unsupported RSA-OAEP hash algorithm ${id.algorithm}`, FailInfo.badAlg);
+  // Parameters must be absent or NULL; implementations differ on which (RFC 4055 §2.1).
+  if (id.parameters && !bytesEqual(toBuffer(id.parameters), Buffer.from([0x05, 0x00]))) {
+    throw new ScepProtocolError("Unexpected hash algorithm parameters in RSA-OAEP parameters", FailInfo.badAlg);
+  }
+  return hash;
+}
+
+/** Interpret a KeyTransRecipientInfo keyEncryptionAlgorithm. */
+function keyTransportFromIdentifier(id: AlgorithmIdentifier): ResolvedKeyTransport {
+  if (id.algorithm === OID.rsaEncryption) return { scheme: "rsa-pkcs1" };
+  if (id.algorithm !== OID.rsaesOaep) {
+    throw new ScepProtocolError(`Unsupported key encryption algorithm ${id.algorithm}`, FailInfo.badAlg);
+  }
+  const params = id.parameters ? parse(id.parameters, OaepParams, "RSAES-OAEP parameters") : new OaepParams();
+  const hash = params.hashAlgorithm ? oaepHashFromIdentifier(params.hashAlgorithm) : "sha1";
+
+  let mgfHash: DigestAlgorithm = "sha1";
+  if (params.maskGenAlgorithm) {
+    if (params.maskGenAlgorithm.algorithm !== OID.mgf1 || !params.maskGenAlgorithm.parameters) {
+      throw new ScepProtocolError(`Unsupported RSA-OAEP mask generation function ${params.maskGenAlgorithm.algorithm}`, FailInfo.badAlg);
+    }
+    mgfHash = oaepHashFromIdentifier(parse(params.maskGenAlgorithm.parameters, AlgorithmIdentifier, "MGF1 parameters"));
+  }
+  // Node.js (OpenSSL's EVP_PKEY_CTX_set_rsa_oaep_md) always uses the OAEP hash for MGF1.
+  if (mgfHash !== hash) {
+    throw new ScepProtocolError(`RSA-OAEP with ${hash} and MGF1-${mgfHash} is not supported`, FailInfo.badAlg);
+  }
+
+  let label: Buffer = Buffer.alloc(0);
+  if (params.pSourceAlgorithm) {
+    if (params.pSourceAlgorithm.algorithm !== OID.pSpecified || !params.pSourceAlgorithm.parameters) {
+      throw new ScepProtocolError(`Unsupported RSA-OAEP label source ${params.pSourceAlgorithm.algorithm}`, FailInfo.badAlg);
+    }
+    label = readOctetString(params.pSourceAlgorithm.parameters);
+  }
+  return { scheme: "rsa-oaep", hash, label };
+}
+
+/** Express a resolved key-transport scheme in its public form. */
+function publicKeyTransport(kt: ResolvedKeyTransport): KeyTransportAlgorithm {
+  if (kt.scheme === "rsa-pkcs1") return "rsa-pkcs1";
+  return kt.label.length ? { scheme: "rsa-oaep", hash: kt.hash, label: kt.label } : { scheme: "rsa-oaep", hash: kt.hash };
+}
+
 /** Encrypt `content` for `recipient` (RSA key transport) and wrap it in a ContentInfo. */
 export function createEnvelopedData(
   content: BytesLike,
   recipient: X509Certificate,
   algorithm: EncryptionAlgorithm,
+  keyTransport: KeyTransportAlgorithm = "rsa-pkcs1",
 ): Buffer {
+  const kt = resolveKeyTransport(keyTransport);
   const { key, iv, ciphertext } = encryptContent(algorithm, content);
   const ktri = new cms.KeyTransRecipientInfo({
     version: cms.CMSVersion.v0,
     rid: new cms.RecipientIdentifier({ issuerAndSerialNumber: issuerAndSerialNumberOf(recipient) }),
-    keyEncryptionAlgorithm: algorithmIdentifier(OID.rsaEncryption),
-    encryptedKey: new OctetString(toArrayBuffer(rsaEncrypt(recipient.publicKey, key))),
+    keyEncryptionAlgorithm: keyEncryptionAlgorithmIdentifier(kt),
+    encryptedKey: new OctetString(toArrayBuffer(rsaEncrypt(recipient.publicKey, key, kt))),
   });
   const ed = new cms.EnvelopedData({
     version: cms.CMSVersion.v0,
@@ -312,6 +385,8 @@ export function createEnvelopedData(
 export interface OpenedEnvelope {
   content: Buffer;
   algorithm: EncryptionAlgorithm;
+  /** Key-transport scheme the sender used for the content-encryption key. */
+  keyTransport: KeyTransportAlgorithm;
 }
 
 /** Decrypt a ContentInfo carrying EnvelopedData using the recipient's certificate and key. */
@@ -321,9 +396,7 @@ export function openEnvelopedData(der: BytesLike, certificate: X509Certificate, 
   const ktris = ed.recipientInfos.map((ri) => ri.ktri).filter((k): k is cms.KeyTransRecipientInfo => !!k);
   const ktri = ktris.find((k) => matchesIdentifier(certificate, k.rid)) ?? (ktris.length === 1 ? ktris[0] : undefined);
   if (!ktri) throw new ScepProtocolError("No matching key transport recipient", FailInfo.badCertId);
-  if (ktri.keyEncryptionAlgorithm.algorithm !== OID.rsaEncryption) {
-    throw new ScepProtocolError(`Unsupported key encryption algorithm ${ktri.keyEncryptionAlgorithm.algorithm}`, FailInfo.badAlg);
-  }
+  const kt = keyTransportFromIdentifier(ktri.keyEncryptionAlgorithm);
 
   const eci = ed.encryptedContentInfo;
   const algorithm = encryptionAlgorithmFromOid(eci.contentEncryptionAlgorithm.algorithm);
@@ -337,6 +410,6 @@ export function openEnvelopedData(der: BytesLike, certificate: X509Certificate, 
     ciphertext = Buffer.concat(eci.encryptedContent.constructedValue.map((o) => toBuffer(o.buffer)));
   } else throw new ScepProtocolError("EnvelopedData has no encrypted content", FailInfo.badRequest);
 
-  const key = rsaDecrypt(privateKey, ktri.encryptedKey.buffer, CONTENT_ENCRYPTION[algorithm].keyLength);
-  return { content: decryptContent(algorithm, key, iv, ciphertext), algorithm };
+  const key = rsaDecrypt(privateKey, ktri.encryptedKey.buffer, CONTENT_ENCRYPTION[algorithm].keyLength, kt);
+  return { content: decryptContent(algorithm, key, iv, ciphertext), algorithm, keyTransport: publicKeyTransport(kt) };
 }

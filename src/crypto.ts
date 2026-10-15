@@ -1,6 +1,6 @@
 import * as nodeCrypto from "node:crypto";
 import type { KeyObject } from "node:crypto";
-import type { DigestAlgorithm, EncryptionAlgorithm } from "./constants.js";
+import type { DigestAlgorithm, EncryptionAlgorithm, KeyTransportAlgorithm } from "./constants.js";
 import { FailInfo } from "./constants.js";
 import { ScepProtocolError } from "./errors.js";
 import { OID } from "./oids.js";
@@ -111,11 +111,69 @@ export function signatureAlgorithmOid(key: KeyObject, algorithm: DigestAlgorithm
 // RSA key transport
 // ---------------------------------------------------------------------------
 
-export function rsaEncrypt(key: KeyObject, data: BytesLike): Buffer {
+/** A key-transport scheme with its defaults filled in. */
+export type ResolvedKeyTransport = { scheme: "rsa-pkcs1" } | { scheme: "rsa-oaep"; hash: DigestAlgorithm; label: Buffer };
+
+export function resolveKeyTransport(algorithm: KeyTransportAlgorithm = "rsa-pkcs1"): ResolvedKeyTransport {
+  if (algorithm === "rsa-pkcs1") return { scheme: "rsa-pkcs1" };
+  if (algorithm === "rsa-oaep") return { scheme: "rsa-oaep", hash: "sha256", label: Buffer.alloc(0) };
+  if (algorithm.scheme !== "rsa-oaep") throw new TypeError(`Unknown key transport scheme ${String(algorithm.scheme)}`);
+  return { scheme: "rsa-oaep", hash: algorithm.hash ?? "sha256", label: toBuffer(algorithm.label ?? new Uint8Array()) };
+}
+
+const HASH_LENGTH: Record<DigestAlgorithm, number> = { sha1: 20, sha256: 32, sha384: 48, sha512: 64 };
+
+function oaepOptions(key: KeyObject, kt: { hash: DigestAlgorithm; label: Buffer }) {
+  return {
+    key,
+    padding: nodeCrypto.constants.RSA_PKCS1_OAEP_PADDING,
+    oaepHash: kt.hash,
+    ...(kt.label.length ? { oaepLabel: kt.label } : {}),
+  };
+}
+
+export function rsaEncrypt(key: KeyObject, data: BytesLike, keyTransport: ResolvedKeyTransport = { scheme: "rsa-pkcs1" }): Buffer {
   if (key.asymmetricKeyType !== "rsa") {
     throw new ScepProtocolError("SCEP key transport requires an RSA recipient key", FailInfo.badAlg);
   }
+  if (keyTransport.scheme === "rsa-oaep") {
+    const input = toBuffer(data);
+    const k = Math.ceil((key.asymmetricKeyDetails?.modulusLength ?? 0) / 8);
+    const max = k - 2 * HASH_LENGTH[keyTransport.hash] - 2;
+    if (input.length > max) {
+      throw new ScepProtocolError(
+        `RSA-OAEP with ${keyTransport.hash} and a ${k * 8}-bit key can carry at most ${Math.max(max, 0)} bytes, not ${input.length}`,
+        FailInfo.badAlg,
+      );
+    }
+    return nodeCrypto.publicEncrypt(oaepOptions(key, keyTransport), input);
+  }
   return nodeCrypto.publicEncrypt({ key, padding: nodeCrypto.constants.RSA_PKCS1_PADDING }, toBuffer(data));
+}
+
+/**
+ * Decrypt a content-encryption key. As with PKCS #1 v1.5, an OAEP decoding failure is turned
+ * into a random key of the expected length (when known) so that every failure surfaces as the
+ * same content-decryption error, leaving no padding oracle (Manger's attack).
+ */
+export function rsaDecrypt(
+  key: KeyObject,
+  data: BytesLike,
+  expectedLength?: number,
+  keyTransport: ResolvedKeyTransport = { scheme: "rsa-pkcs1" },
+): Buffer {
+  if (keyTransport.scheme === "rsa-pkcs1") return rsaPkcs1Decrypt(key, data, expectedLength);
+  let message: Buffer | undefined;
+  try {
+    message = nodeCrypto.privateDecrypt(oaepOptions(key, keyTransport), toBuffer(data));
+  } catch (err) {
+    if (!expectedLength) {
+      throw new ScepProtocolError("Unable to decrypt content-encryption key", FailInfo.badMessageCheck, { cause: err });
+    }
+  }
+  if (message && (expectedLength === undefined || message.length === expectedLength)) return message;
+  if (expectedLength) return nodeCrypto.randomBytes(expectedLength);
+  throw new ScepProtocolError("Unable to decrypt content-encryption key", FailInfo.badMessageCheck);
 }
 
 /**
@@ -124,7 +182,7 @@ export function rsaEncrypt(key: KeyObject, data: BytesLike): Buffer {
  * constant-ish time, substituting a random key of the expected length on padding failure so
  * that the error surfaces later as an indistinguishable content-decryption failure.
  */
-export function rsaDecrypt(key: KeyObject, data: BytesLike, expectedLength?: number): Buffer {
+function rsaPkcs1Decrypt(key: KeyObject, data: BytesLike, expectedLength?: number): Buffer {
   const input = toBuffer(data);
   try {
     return nodeCrypto.privateDecrypt({ key, padding: nodeCrypto.constants.RSA_PKCS1_PADDING }, input);

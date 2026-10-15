@@ -1,4 +1,7 @@
 import { describe, expect, it } from "vitest";
+import * as asn1Cms from "@peculiar/asn1-cms";
+import { AsnConvert } from "@peculiar/asn1-schema";
+import { AlgorithmIdentifier } from "@peculiar/asn1-x509";
 import {
   createCertificate,
   createCrl,
@@ -16,7 +19,11 @@ import {
   buildName,
   encodeName,
   type EncryptionAlgorithm,
+  type KeyTransportAlgorithm,
+  OID,
+  FailInfo,
 } from "../src/index.js";
+import { OaepParams } from "../src/asn1.js";
 import { hasOpenSsl, makeCa, openssl, pemKey } from "./helpers.js";
 
 const ossl = hasOpenSsl();
@@ -192,3 +199,116 @@ describe("EnvelopedData", () => {
   });
 });
 
+
+describe("EnvelopedData with RSA-OAEP", () => {
+  const { privateKey } = generateRsaKeyPair();
+  const certificate = createSelfSignedCertificate({ subject: "CN=recipient", privateKey });
+
+  const ktriOf = (der: Buffer) => {
+    const ci = AsnConvert.parse(der, asn1Cms.ContentInfo);
+    const ed = AsnConvert.parse(ci.content, asn1Cms.EnvelopedData);
+    return { ci, ed, ktri: ed.recipientInfos[0]!.ktri! };
+  };
+  const withKeyEncryptionAlgorithm = (der: Buffer, alg: AlgorithmIdentifier) => {
+    const { ci, ed, ktri } = ktriOf(der);
+    ktri.keyEncryptionAlgorithm = alg;
+    ci.content = AsnConvert.serialize(ed);
+    return Buffer.from(AsnConvert.serialize(ci));
+  };
+  const hashId = (oid: string) => new AlgorithmIdentifier({ algorithm: oid });
+
+  it.each<[KeyTransportAlgorithm, KeyTransportAlgorithm]>([
+    ["rsa-pkcs1", "rsa-pkcs1"],
+    ["rsa-oaep", { scheme: "rsa-oaep", hash: "sha256" }],
+    [{ scheme: "rsa-oaep", hash: "sha1" }, { scheme: "rsa-oaep", hash: "sha1" }],
+    [{ scheme: "rsa-oaep", hash: "sha512" }, { scheme: "rsa-oaep", hash: "sha512" }],
+    [
+      { scheme: "rsa-oaep", hash: "sha256", label: Buffer.from("label") },
+      { scheme: "rsa-oaep", hash: "sha256", label: Buffer.from("label") },
+    ],
+  ])("round-trips with %j", (keyTransport, expected) => {
+    const env = createEnvelopedData(content, certificate, "aes-256-cbc", keyTransport);
+    const opened = openEnvelopedData(env, certificate, privateKey);
+    expect(opened.content).toEqual(content);
+    expect(opened.keyTransport).toEqual(expected);
+  });
+
+  it("encodes RFC 4055 parameters in DER", () => {
+    const sha1 = ktriOf(createEnvelopedData(content, certificate, "aes-128-cbc", { scheme: "rsa-oaep", hash: "sha1" }));
+    expect(sha1.ktri.keyEncryptionAlgorithm.algorithm).toBe(OID.rsaesOaep);
+    // All fields equal their DEFAULT values and are omitted.
+    expect(Buffer.from(sha1.ktri.keyEncryptionAlgorithm.parameters!).toString("hex")).toBe("3000");
+
+    const sha256 = ktriOf(createEnvelopedData(content, certificate, "aes-128-cbc", "rsa-oaep"));
+    const params = AsnConvert.parse(sha256.ktri.keyEncryptionAlgorithm.parameters!, OaepParams);
+    expect(params.hashAlgorithm?.algorithm).toBe(OID.sha256);
+    expect(params.hashAlgorithm?.parameters).toBeUndefined();
+    expect(params.maskGenAlgorithm?.algorithm).toBe(OID.mgf1);
+    expect(AsnConvert.parse(params.maskGenAlgorithm!.parameters!, AlgorithmIdentifier).algorithm).toBe(OID.sha256);
+    expect(params.pSourceAlgorithm).toBeUndefined();
+  });
+
+  it("accepts NULL hash parameters", () => {
+    const env = createEnvelopedData(content, certificate, "aes-128-cbc", "rsa-oaep");
+    const nullHash = new AlgorithmIdentifier({ algorithm: OID.sha256, parameters: null });
+    const params = new OaepParams({
+      hashAlgorithm: nullHash,
+      maskGenAlgorithm: new AlgorithmIdentifier({ algorithm: OID.mgf1, parameters: AsnConvert.serialize(nullHash) }),
+    });
+    const patched = withKeyEncryptionAlgorithm(
+      env,
+      new AlgorithmIdentifier({ algorithm: OID.rsaesOaep, parameters: AsnConvert.serialize(params) }),
+    );
+    expect(openEnvelopedData(patched, certificate, privateKey).content).toEqual(content);
+  });
+
+  it.each([
+    [
+      "an MGF1 hash that differs from the OAEP hash",
+      new OaepParams({
+        hashAlgorithm: hashId(OID.sha256),
+        maskGenAlgorithm: new AlgorithmIdentifier({ algorithm: OID.mgf1, parameters: AsnConvert.serialize(hashId(OID.sha1)) }),
+      }),
+    ],
+    ["an unknown hash", new OaepParams({ hashAlgorithm: hashId(OID.md5) })],
+    ["an unknown mask generation function", new OaepParams({ maskGenAlgorithm: hashId("1.2.3.4") })],
+    ["an unknown label source", new OaepParams({ pSourceAlgorithm: hashId("1.2.3.4") })],
+  ])("rejects %s with badAlg", (_, params) => {
+    const env = createEnvelopedData(content, certificate, "aes-128-cbc", "rsa-oaep");
+    const patched = withKeyEncryptionAlgorithm(
+      env,
+      new AlgorithmIdentifier({ algorithm: OID.rsaesOaep, parameters: AsnConvert.serialize(params) }),
+    );
+    expect(() => openEnvelopedData(patched, certificate, privateKey)).toThrow(expect.objectContaining({ failInfo: FailInfo.badAlg }));
+  });
+
+  it.runIf(ossl).each<KeyTransportAlgorithm>(["rsa-oaep", { scheme: "rsa-oaep", hash: "sha1" }, { scheme: "rsa-oaep", hash: "sha512" }])(
+    "is decrypted by OpenSSL (%j)",
+    (keyTransport) => {
+      const env = createEnvelopedData(content, certificate, "aes-128-cbc", keyTransport);
+      const { stdout } = openssl(
+        ["cms", "-decrypt", "-inform", "DER", "-in", "e.der", "-recip", "c.pem", "-inkey", "k.pem"],
+        { "e.der": env, "c.pem": certificate.toString(), "k.pem": pemKey(privateKey) },
+      );
+      expect(stdout).toEqual(content);
+    },
+  );
+
+  it.runIf(ossl).each([
+    [[], "sha1"],
+    [["-keyopt", "rsa_oaep_md:sha256"], "sha256"],
+    [["-keyopt", "rsa_oaep_md:sha512", "-keyopt", "rsa_mgf1_md:sha512"], "sha512"],
+  ] as const)("decrypts OpenSSL output (OAEP %j)", (opts, hash) => {
+    const { files } = openssl(
+      [
+        "cms", "-encrypt", "-binary", "-aes128", "-in", "c.bin", "-outform", "DER", "-out", "e.der",
+        "-recip", "c.pem", "-keyopt", "rsa_padding_mode:oaep", ...opts,
+      ],
+      { "c.bin": content, "c.pem": certificate.toString() },
+      ["e.der"],
+    );
+    const opened = openEnvelopedData(files["e.der"]!, certificate, privateKey);
+    expect(opened.content).toEqual(content);
+    expect(opened.keyTransport).toEqual({ scheme: "rsa-oaep", hash });
+  });
+});

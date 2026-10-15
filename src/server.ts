@@ -17,6 +17,7 @@ import {
   Operation,
   PkiStatus,
   type DigestAlgorithm,
+  type KeyTransportAlgorithm,
 } from "./constants.js";
 import { toPrivateKey, type PrivateKeyLike } from "./crypto.js";
 import { ScepError, ScepProtocolError } from "./errors.js";
@@ -107,6 +108,13 @@ export interface ScepServerOptions {
   nextCaCertificates?: CertificateLike[];
   /** Capabilities advertised by GetCACaps. Sensible RFC 8894 defaults are used when omitted. */
   capabilities?: string[];
+  /**
+   * Key-transport scheme for CertRep envelopes. `"mirror"` (the default) answers with the scheme
+   * the request used, so OAEP clients get OAEP and everyone else gets RSAES-PKCS1-v1_5.
+   */
+  keyTransport?: "mirror" | KeyTransportAlgorithm;
+  /** Reject requests whose pkcsPKIEnvelope uses RSAES-PKCS1-v1_5 key transport (badAlg). */
+  requireOaep?: boolean;
   /** Reject requests whose signingTime differs from local time by more than this (badTime). */
   maxClockSkewMs?: number;
   handler: ScepHandler;
@@ -292,7 +300,7 @@ export class ScepServer {
   }
 
   private async dispatch(message: PkiMessage): Promise<ScepResult> {
-    const { handler, maxClockSkewMs } = this.options;
+    const { handler, maxClockSkewMs, requireOaep } = this.options;
     if (maxClockSkewMs !== undefined && message.signingTime) {
       if (Math.abs(message.signingTime.getTime() - Date.now()) > maxClockSkewMs) {
         return { status: "failure", failInfo: FailInfo.badTime };
@@ -300,6 +308,9 @@ export class ScepServer {
     }
     if (!message.messageData) {
       return { status: "failure", failInfo: FailInfo.badRequest, failInfoText: "Missing pkcsPKIEnvelope" };
+    }
+    if (requireOaep && message.keyTransport === "rsa-pkcs1") {
+      return { status: "failure", failInfo: FailInfo.badAlg, failInfoText: "RSAES-OAEP key transport is required" };
     }
     const signer = message.signerCertificate;
     const ctx: ScepRequestContext = {
@@ -352,9 +363,14 @@ export class ScepServer {
     }
   }
 
+  private responseKeyTransport(requested: KeyTransportAlgorithm | undefined): KeyTransportAlgorithm {
+    const configured = this.options.keyTransport ?? "mirror";
+    return configured === "mirror" ? (requested ?? "rsa-pkcs1") : configured;
+  }
+
   private certRep(
     request: Pick<PkiMessage, "transactionId" | "senderNonce" | "digestAlgorithm"> &
-      Partial<Pick<PkiMessage, "signerCertificate" | "encryptionAlgorithm">>,
+      Partial<Pick<PkiMessage, "signerCertificate" | "encryptionAlgorithm" | "keyTransport">>,
     result: ScepResult,
   ): Buffer {
     const common = {
@@ -376,6 +392,7 @@ export class ScepServer {
         messageData,
         recipient: request.signerCertificate,
         encryptionAlgorithm: request.encryptionAlgorithm ?? "aes-128-cbc",
+        keyTransport: this.responseKeyTransport(request.keyTransport),
       });
     }
     if (result.status === "pending") return encodePkiMessage({ ...common, pkiStatus: PkiStatus.PENDING });

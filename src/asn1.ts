@@ -5,7 +5,7 @@
 import * as asn1js from "asn1js";
 import { AsnArray, AsnConvert, AsnProp, AsnPropTypes, AsnType, AsnTypeTypes } from "@peculiar/asn1-schema";
 import { DigestAlgorithmIdentifiers, EncapsulatedContentInfo, SignerInfos } from "@peculiar/asn1-cms";
-import { Name } from "@peculiar/asn1-x509";
+import { AlgorithmIdentifier, Name } from "@peculiar/asn1-x509";
 import { ScepProtocolError } from "./errors.js";
 import { FailInfo } from "./constants.js";
 import { toArrayBuffer, toBuffer, type BytesLike } from "./util.js";
@@ -63,6 +63,31 @@ export class IssuerAndSubject {
   public subject = new Name();
 
   constructor(params: Partial<IssuerAndSubject> = {}) {
+    Object.assign(this, params);
+  }
+}
+
+/**
+ * ```asn
+ * RSAES-OAEP-params ::= SEQUENCE {
+ *   hashAlgorithm      [0] HashAlgorithm     DEFAULT sha1Identifier,
+ *   maskGenAlgorithm   [1] MaskGenAlgorithm  DEFAULT mgf1SHA1Identifier,
+ *   pSourceAlgorithm   [2] PSourceAlgorithm  DEFAULT pSpecifiedEmptyIdentifier }
+ * ```
+ * RFC 4055 §4.1. Defaulted fields are modelled as optional so that absent fields stay
+ * distinguishable after parsing (the upstream schema substitutes a non-empty pSpecified label).
+ */
+export class OaepParams {
+  @AsnProp({ type: AlgorithmIdentifier, context: 0, optional: true })
+  public hashAlgorithm?: AlgorithmIdentifier;
+
+  @AsnProp({ type: AlgorithmIdentifier, context: 1, optional: true })
+  public maskGenAlgorithm?: AlgorithmIdentifier;
+
+  @AsnProp({ type: AlgorithmIdentifier, context: 2, optional: true })
+  public pSourceAlgorithm?: AlgorithmIdentifier;
+
+  constructor(params: Partial<OaepParams> = {}) {
     Object.assign(this, params);
   }
 }

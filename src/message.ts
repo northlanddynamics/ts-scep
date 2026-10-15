@@ -20,6 +20,7 @@ import {
   PkiStatus,
   type DigestAlgorithm,
   type EncryptionAlgorithm,
+  type KeyTransportAlgorithm,
 } from "./constants.js";
 import { digest, randomBytes, toPublicKey, type PublicKeyLike } from "./crypto.js";
 import { ScepProtocolError } from "./errors.js";
@@ -53,6 +54,8 @@ export interface EncodePkiMessageOptions {
   signer: ScepIdentity;
   digestAlgorithm?: DigestAlgorithm;
   encryptionAlgorithm?: EncryptionAlgorithm;
+  /** Key-transport scheme for the pkcsPKIEnvelope (default rsa-pkcs1). */
+  keyTransport?: KeyTransportAlgorithm;
   /** Additional certificates to include in the SignedData (the signer certificate is always included). */
   certificates?: X509Certificate[];
   /** signingTime attribute; defaults to now, `false` omits it. */
@@ -83,7 +86,12 @@ export function encodePkiMessage(opts: EncodePkiMessageOptions): Buffer {
   let envelope: Buffer | undefined;
   if (opts.messageData !== undefined) {
     if (!opts.recipient) throw new TypeError("messageData requires a recipient certificate");
-    envelope = createEnvelopedData(opts.messageData, opts.recipient, opts.encryptionAlgorithm ?? "aes-128-cbc");
+    envelope = createEnvelopedData(
+      opts.messageData,
+      opts.recipient,
+      opts.encryptionAlgorithm ?? "aes-128-cbc",
+      opts.keyTransport,
+    );
   }
 
   return createSignedData({
@@ -120,6 +128,8 @@ export interface PkiMessage {
   messageData?: Buffer;
   /** Content-encryption algorithm of the envelope, once decrypted. */
   encryptionAlgorithm?: EncryptionAlgorithm;
+  /** Key-transport scheme of the envelope, once decrypted. */
+  keyTransport?: KeyTransportAlgorithm;
 }
 
 export interface DecodePkiMessageOptions {
@@ -186,6 +196,7 @@ export function decodePkiMessage(der: BytesLike, opts: DecodePkiMessageOptions =
     const opened = openEnvelopedData(msg.envelope, opts.recipient.certificate, opts.recipient.privateKey);
     msg.messageData = opened.content;
     msg.encryptionAlgorithm = opened.algorithm;
+    msg.keyTransport = opened.keyTransport;
   }
   return msg;
 }

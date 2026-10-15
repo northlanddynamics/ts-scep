@@ -152,6 +152,35 @@ describe("SCEP over HTTP (CA mode)", () => {
     if (opts.encryptionAlgorithm) expect(store.lastRequest?.message.encryptionAlgorithm).toBe(opts.encryptionAlgorithm);
   });
 
+  it.each([
+    { name: "SHA-256", keyTransport: "rsa-oaep" as const, expected: { scheme: "rsa-oaep", hash: "sha256" } },
+    { name: "SHA-1", keyTransport: { scheme: "rsa-oaep" as const, hash: "sha1" as const }, expected: { scheme: "rsa-oaep", hash: "sha1" } },
+  ])("enrols with RSA-OAEP key transport ($name)", async ({ keyTransport, expected }) => {
+    const client = new ScepClient({ url, keyTransport });
+    const { privateKey, csr } = newRequest("device-oaep");
+    const result = await client.enroll({ csr, privateKey });
+    expect(result.status).toBe(PkiStatus.SUCCESS);
+    expect(store.lastRequest?.message.keyTransport).toEqual(expected);
+  });
+
+  it("mirrors the request's key transport in the CertRep envelope", async () => {
+    const { privateKey, csr } = newRequest("device-mirror");
+    const self = createSelfSignedCertificate({ subject: "CN=device-mirror", privateKey });
+    for (const keyTransport of ["rsa-pkcs1", { scheme: "rsa-oaep", hash: "sha384" }] as const) {
+      const req = encodePkiMessage({
+        messageType: MessageType.PKCSReq,
+        transactionId: "MIRROR",
+        messageData: csr,
+        recipient: ca.certificate,
+        signer: { certificate: self, privateKey },
+        keyTransport,
+      });
+      const rep = decodePkiMessage(await server.pkiOperation(req), { recipient: { certificate: self, privateKey } });
+      expect(rep.pkiStatus).toBe(PkiStatus.SUCCESS);
+      expect(rep.keyTransport).toEqual(keyTransport);
+    }
+  });
+
   it("rejects a bad challenge password with failInfo", async () => {
     const client = new ScepClient({ url });
     const { privateKey, csr } = newRequest("device-2", "wrong");
@@ -254,6 +283,36 @@ describe("SCEP over HTTP (CA mode)", () => {
     expect((await fetch(`${url}?operation=Nope`)).status).toBe(400);
     const res = await fetch(`${url}?operation=PKIOperation`, { method: "POST", body: Buffer.from("garbage") });
     expect(res.status).toBe(400);
+  });
+});
+
+describe("SCEP server key-transport policy", () => {
+  const ca = makeCa();
+  const { privateKey, csr } = newRequest("device-policy");
+  const self = createSelfSignedCertificate({ subject: "CN=device-policy", privateKey });
+  const request = (keyTransport: "rsa-pkcs1" | "rsa-oaep") =>
+    encodePkiMessage({
+      messageType: MessageType.PKCSReq,
+      transactionId: "POLICY",
+      messageData: csr,
+      recipient: ca.certificate,
+      signer: { certificate: self, privateKey },
+      keyTransport,
+    });
+  const decode = (der: Buffer) => decodePkiMessage(der, { recipient: { certificate: self, privateKey } });
+
+  it("rejects RSAES-PKCS1-v1_5 requests with badAlg when OAEP is required", async () => {
+    const server = new ScepServer({ ca, handler: new MemoryCa(ca), requireOaep: true });
+    const rejected = decode(await server.pkiOperation(request("rsa-pkcs1")));
+    expect(rejected.pkiStatus).toBe(PkiStatus.FAILURE);
+    expect(rejected.failInfo).toBe(FailInfo.badAlg);
+    expect(decode(await server.pkiOperation(request("rsa-oaep"))).pkiStatus).toBe(PkiStatus.SUCCESS);
+  });
+
+  it("uses a configured response key transport instead of mirroring", async () => {
+    const server = new ScepServer({ ca, handler: new MemoryCa(ca), keyTransport: "rsa-oaep" });
+    const rep = decode(await server.pkiOperation(request("rsa-pkcs1")));
+    expect(rep.keyTransport).toEqual({ scheme: "rsa-oaep", hash: "sha256" });
   });
 });
 

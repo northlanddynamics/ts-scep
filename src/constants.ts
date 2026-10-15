@@ -81,3 +81,20 @@ export type DigestAlgorithm = "sha1" | "sha256" | "sha384" | "sha512";
  * supported for interoperability with legacy servers; it is never selected automatically.
  */
 export type EncryptionAlgorithm = "aes-128-cbc" | "aes-192-cbc" | "aes-256-cbc" | "des-ede3-cbc" | "des-cbc";
+
+/** RSAES-OAEP parameters (RFC 8017 §7.1, RFC 4055 §4.1). MGF1 always uses the same hash. */
+export interface RsaOaepParams {
+  scheme: "rsa-oaep";
+  /** Hash for OAEP and MGF1 (default sha256). */
+  hash?: DigestAlgorithm;
+  /** Encoding parameters (the OAEP label), carried as pSpecified. Empty by default. */
+  label?: Uint8Array;
+}
+
+/**
+ * Key-transport scheme used to encrypt the content-encryption key of a pkcsPKIEnvelope.
+ * `rsa-pkcs1` is RSAES-PKCS1-v1_5, which every SCEP implementation supports; `rsa-oaep` is
+ * shorthand for RSAES-OAEP with SHA-256. RFC 8894 defines no capability keyword for OAEP,
+ * so it must be enabled explicitly.
+ */
+export type KeyTransportAlgorithm = "rsa-pkcs1" | "rsa-oaep" | RsaOaepParams;

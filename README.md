@@ -66,7 +66,7 @@ base64-encoded and URL-encoded into the query string.
 ContentInfo { SignedData {
   encapContentInfo: id-data, eContent = pkcsPKIEnvelope     -- omitted on CertRep FAILURE / PENDING
                      └─ ContentInfo { EnvelopedData {         -- RSA key transport to the recipient
-                          encryptedContent = messageData } }
+                          encryptedContent = messageData } }  -- rsaEncryption or RSAES-OAEP
   certificates: signer certificate (self-signed on first enrolment)
   signerInfo.signedAttrs:
     transactionID   2.16.840.1.113733.1.9.7   PrintableString
@@ -137,6 +137,11 @@ The client negotiates algorithms and transport from `GetCACaps`. With `SCEPStand
 AES-128-CBC, otherwise 3DES. It prefers SHA-256, then SHA-512, then SHA-1. It uses POST when
 `POSTPKIOperation` or `SCEPStandard` is advertised. You can override any of these with
 `encryptionAlgorithm`, `digestAlgorithm` or `usePost`.
+
+The content-encryption key is wrapped with RSAES-PKCS1-v1_5 by default. To use RSAES-OAEP, set
+`keyTransport` to `"rsa-oaep"` (SHA-256) or to `{ scheme: "rsa-oaep", hash, label }`. RFC 8894 has no
+capability keyword for OAEP, so the client can't detect support. Only enable it for CAs you know accept
+it: many deployed SCEP servers, including micromdm/scep and older NDES, only handle PKCS #1 v1.5.
 
 Every CertRep is checked before it's accepted:
 
@@ -210,6 +215,10 @@ Before your handler runs, the server checks that:
 - A self-signed signer uses the CSR's key.
 - A `RenewalReq` is signed by a certificate this CA issued.
 
+CertRep envelopes use the key-transport scheme of the request, so an OAEP client gets an OAEP reply
+and every other client gets PKCS #1 v1.5. Set `keyTransport` to a fixed scheme to override this, and
+`requireOaep: true` to reject PKCS #1 v1.5 requests with `badAlg`.
+
 If a request fails verification or decryption, the server returns a signed `FAILURE` CertRep
 (`badMessageCheck`, `badAlg`, and so on) when it can identify the request. Otherwise it returns HTTP 400.
 
@@ -244,6 +253,8 @@ DER.
   encryption. Compare it in constant time on the server.
 - SCEP gives no proof that a request is fresh. If replay matters, enable `maxClockSkewMs` and track
   transaction IDs in your handler.
+- RSAES-OAEP is supported for key transport (see `keyTransport`). OAEP decoding failures are also
+  replaced by a random key, so they surface as ordinary content-decryption errors.
 - RSA PKCS #1 v1.5 decryption falls back to an implicit-rejection style path on Node builds that reject
   it natively. Padding errors can't be told apart from content-decryption errors.
 - DES and SHA-1 are only used when a peer requires them. Single DES is never picked automatically.
@@ -277,8 +288,9 @@ The CI workflow builds both tools and runs these suites.
 
 - **Key types.** SCEP's key transport needs RSA, so requester and CA/RA encryption keys must be RSA.
   ECDSA signatures can be verified, but not used for enrolment.
-- **Recipient and cipher support.** Only key-transport recipients (`rsaEncryption`) are supported.
-  RSAES-OAEP, key agreement, RC2 and Blowfish are not.
+- **Recipient and cipher support.** Only key-transport recipients are supported (`rsaEncryption` and
+  `id-RSAES-OAEP` with SHA-1/256/384/512). OAEP parameters with a different MGF1 hash than the OAEP
+  hash are rejected, because Node.js can't express them. Key agreement, RC2 and Blowfish are not supported.
 - **Runtime.** The SDK runs on Node.js (≥ 20) only, not in the browser.
 
 ## License
