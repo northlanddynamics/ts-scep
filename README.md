@@ -14,8 +14,9 @@ It has been tested against OpenSSL, the [sscep](https://github.com/certnanny/ssc
 npm install ts-scep
 ```
 
-You need Node.js 20 or later. The SDK uses `node:crypto`. WebCrypto can't do RSA PKCS #1 v1.5 key transport
-or 3DES, and SCEP depends on both.
+You need Node.js 20 or later, or Bun 1.4 or later. The SDK uses `node:crypto`, because WebCrypto can't do
+RSA PKCS #1 v1.5 key transport or 3DES, and SCEP depends on both. Runtimes that only offer WebCrypto
+(browsers, Cloudflare Workers) are not supported.
 
 ---
 
@@ -24,6 +25,7 @@ or 3DES, and SCEP depends on both.
 - [SCEP in brief (RFC 8894)](#scep-in-brief-rfc-8894)
 - [Client usage](#client-usage)
 - [Server usage](#server-usage)
+  - [Bun and Hono](#bun-and-hono)
 - [Low-level API](#low-level-api)
 - [Security notes](#security-notes)
 - [Testing](#testing)
@@ -205,7 +207,7 @@ const scep = new ScepServer({
 });
 
 createServer(scep.nodeHandler()).listen(8080);    // node:http or Express (also accepts express.raw())
-// export default { fetch: scep.fetchHandler };   // Fetch-API runtimes (Bun, Deno, Workers, Hono, …)
+// export default { fetch: scep.fetchHandler };   // Fetch-API runtimes (Bun, Hono, …), see below
 // await scep.handle({ method, query, body });    // any other framework
 ```
 
@@ -222,8 +224,45 @@ and every other client gets PKCS #1 v1.5. Set `keyTransport` to a fixed scheme t
 If a request fails verification or decryption, the server returns a signed `FAILURE` CertRep
 (`badMessageCheck`, `badAlg`, and so on) when it can identify the request. Otherwise it returns HTTP 400.
 
-A runnable example CA is in [`examples/server.ts`](examples/server.ts). A client example is in
-[`examples/enroll.ts`](examples/enroll.ts).
+POST bodies larger than `maxBodyBytes` (default 1 MiB) get HTTP 413 from `nodeHandler` and `fetchHandler`.
+
+A runnable example CA is in [`examples/server.ts`](examples/server.ts), and the same CA on Hono and Bun is in
+[`examples/server-hono.ts`](examples/server-hono.ts). A client example is in [`examples/enroll.ts`](examples/enroll.ts).
+
+### Bun and Hono
+
+`fetchHandler` is a bound `(Request) => Promise<Response>`, so it can be handed straight to `Bun.serve` or
+to a Hono route. The handler ignores the path, so mount it wherever your clients expect it:
+
+```ts
+import { Hono } from "hono";
+
+const app = new Hono();
+app.all("/scep", (c) => scep.fetchHandler(c.req.raw));
+app.all("/cgi-bin/pkiclient.exe", (c) => scep.fetchHandler(c.req.raw));
+
+export default { port: 8080, fetch: app.fetch };   // bun run server.ts
+```
+
+`fetchHandler` reads the request body itself and enforces `maxBodyBytes`, while the body streams in as well as
+from `Content-Length`. Mount it before any middleware that reads the body. If middleware has already read it
+(Hono's `bodyLimit`, logging, signature checks), the stream is spent, so pass the bytes instead:
+
+```ts
+import { bodyLimit } from "hono/body-limit";
+
+app.all("/scep", bodyLimit({ maxSize: 256 * 1024 }), async (c) =>
+  scep.handleFetch(c.req.raw, { body: new Uint8Array(await c.req.arrayBuffer()) }),
+);
+```
+
+`Bun.serve` accepts bodies of up to 128 MB by default. `maxBodyBytes` stops SCEP from buffering more than it
+needs, but you can also lower `maxRequestBodySize` in `Bun.serve`.
+
+Install the published package, which ships compiled JavaScript. If you import the TypeScript sources directly
+(a workspace or git dependency), enable `"experimentalDecorators": true` and `"useDefineForClassFields": false`
+in your tsconfig, because the ASN.1 schema library uses legacy decorators. Without them, Bun fails when it
+loads the module.
 
 ---
 
@@ -255,8 +294,12 @@ DER.
   transaction IDs in your handler.
 - RSAES-OAEP is supported for key transport (see `keyTransport`). OAEP decoding failures are also
   replaced by a random key, so they surface as ordinary content-decryption errors.
-- RSA PKCS #1 v1.5 decryption falls back to an implicit-rejection style path on Node builds that reject
-  it natively. Padding errors can't be told apart from content-decryption errors.
+- RSA PKCS #1 v1.5 decryption uses implicit rejection (draft-irtf-cfrg-rsa-guidance): a malformed
+  ciphertext deterministically decrypts to a synthetic key, so padding errors can't be told apart from
+  content-decryption errors (Bleichenbacher / Marvin). Node.js on OpenSSL 3.2+ does this natively. On Bun,
+  and on Node builds that refuse PKCS #1 v1.5 decryption, the SDK performs raw RSA and runs the same
+  algorithm in branch-free JavaScript, with output identical to OpenSSL's. JavaScript gives no hard
+  constant-time guarantees. If every client in your fleet supports OAEP, set `requireOaep: true`.
 - DES and SHA-1 are only used when a peer requires them. Single DES is never picked automatically.
 
 ---
@@ -265,6 +308,7 @@ DER.
 
 ```sh
 npm test            # unit + end-to-end tests (OpenSSL interop runs if `openssl` is on PATH)
+npm run test:bun    # the same suite with Bun as the runtime (Hono tests use Bun.serve)
 npm run typecheck
 npm run build
 ```
@@ -280,7 +324,7 @@ SSCEP_BIN=/path/to/sscep npm test
 SCEPSERVER_BIN=/path/to/scepserver npm test
 ```
 
-The CI workflow builds both tools and runs these suites.
+The CI workflow builds both tools and runs these suites on Node.js and on Bun.
 
 ---
 
@@ -291,7 +335,8 @@ The CI workflow builds both tools and runs these suites.
 - **Recipient and cipher support.** Only key-transport recipients are supported (`rsaEncryption` and
   `id-RSAES-OAEP` with SHA-1/256/384/512). OAEP parameters with a different MGF1 hash than the OAEP
   hash are rejected, because Node.js can't express them. Key agreement, RC2 and Blowfish are not supported.
-- **Runtime.** The SDK runs on Node.js (≥ 20) only, not in the browser.
+- **Runtime.** The SDK runs on Node.js (≥ 20) and Bun (≥ 1.4, the version CI tests). It does not run in
+  browsers or WebCrypto-only runtimes such as Cloudflare Workers.
 
 ## License
 
