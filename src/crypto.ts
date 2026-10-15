@@ -177,44 +177,122 @@ export function rsaDecrypt(
 }
 
 /**
- * RSAES-PKCS1-v1_5 decryption. Newer Node.js releases implement implicit rejection natively;
- * on releases that refuse PKCS#1 v1.5 private decryption we fall back to raw RSA and unpad in
- * constant-ish time, substituting a random key of the expected length on padding failure so
- * that the error surfaces later as an indistinguishable content-decryption failure.
+ * RSAES-PKCS1-v1_5 decryption with implicit rejection (draft-irtf-cfrg-rsa-guidance §7.2), so that
+ * a padding error is indistinguishable from a wrong key (Bleichenbacher / Marvin attacks): a
+ * malformed ciphertext deterministically yields a synthetic message derived from the private key
+ * and the ciphertext, and the failure only surfaces later as a content-decryption error.
+ *
+ * Node.js with OpenSSL 3.2+ implements implicit rejection natively. Runtimes that refuse PKCS #1
+ * v1.5 private decryption (Bun, Node.js on older OpenSSL) use raw RSA plus the same algorithm,
+ * implemented below without data-dependent branches, so both paths return the same bytes.
+ *
+ * When `expectedLength` is given, a result of any other length is replaced, again without
+ * branching, by a synthetic key of that length.
  */
 function rsaPkcs1Decrypt(key: KeyObject, data: BytesLike, expectedLength?: number): Buffer {
   const input = toBuffer(data);
+  const kdk = implicitRejectionKdk(key, input);
+  let message: Buffer;
   try {
-    return nodeCrypto.privateDecrypt({ key, padding: nodeCrypto.constants.RSA_PKCS1_PADDING }, input);
+    message = nodeCrypto.privateDecrypt({ key, padding: nodeCrypto.constants.RSA_PKCS1_PADDING }, input);
   } catch (err) {
     if (!/no longer supported/i.test(String((err as Error).message))) {
-      if (expectedLength) return nodeCrypto.randomBytes(expectedLength);
       throw new ScepProtocolError("Unable to decrypt content-encryption key", FailInfo.badMessageCheck, { cause: err });
     }
+    let em: Buffer;
+    try {
+      em = nodeCrypto.privateDecrypt({ key, padding: nodeCrypto.constants.RSA_NO_PADDING }, input);
+    } catch (rawErr) {
+      throw new ScepProtocolError("Unable to decrypt content-encryption key", FailInfo.badMessageCheck, { cause: rawErr });
+    }
+    message = pkcs1v15DecodeImplicit(em, kdk);
   }
-  const em = nodeCrypto.privateDecrypt({ key, padding: nodeCrypto.constants.RSA_NO_PADDING }, input);
-  const message = pkcs1v15Unpad(em, expectedLength);
-  if (message) return message;
-  if (expectedLength) return nodeCrypto.randomBytes(expectedLength);
-  throw new ScepProtocolError("Unable to decrypt content-encryption key", FailInfo.badMessageCheck);
+  if (expectedLength === undefined) return message;
+  const synthetic = rsaPrf(kdk, "ts-scep cek", expectedLength);
+  const lengthOk = ctEq(message.length, expectedLength);
+  const out = Buffer.alloc(expectedLength);
+  for (let i = 0; i < expectedLength; i++) out[i] = ctSelect(lengthOk, message[i] ?? 0, synthetic[i]!);
+  return out;
 }
 
+const kdkKeys = new WeakMap<KeyObject, { hash: Buffer; length: number }>();
+
 /**
- * Remove RSAES-PKCS1-v1_5 padding (EM = 0x00 || 0x02 || PS || 0x00 || M, |PS| >= 8) without
- * data-dependent early exits. Returns undefined on malformed padding or unexpected length.
+ * Key-derivation key for implicit rejection: HMAC-SHA256 keyed with SHA-256 of the private
+ * exponent (big-endian, modulus length), over the ciphertext left-padded to the modulus length.
  * @internal
  */
-export function pkcs1v15Unpad(em: Buffer, expectedLength?: number): Buffer | undefined {
-  let good = (em[0] === 0x00 ? 1 : 0) & (em[1] === 0x02 ? 1 : 0);
-  let sep = 0;
-  for (let i = 2; i < em.length; i++) {
-    const isFirstZero = (em[i] === 0 ? 1 : 0) & (sep === 0 ? 1 : 0);
-    sep = isFirstZero ? i : sep;
+export function implicitRejectionKdk(key: KeyObject, ciphertext: Uint8Array): Buffer {
+  let secret = kdkKeys.get(key);
+  if (!secret) {
+    const jwk = key.export({ format: "jwk" });
+    if (!jwk.d || !jwk.n) throw new TypeError("Expected an RSA private key");
+    const length = Buffer.from(jwk.n, "base64url").length;
+    const exponent = Buffer.from(jwk.d, "base64url");
+    const d = Buffer.alloc(length);
+    exponent.copy(d, length - exponent.length);
+    secret = { hash: nodeCrypto.createHash("sha256").update(d).digest(), length };
+    kdkKeys.set(key, secret);
   }
-  good &= sep >= 10 ? 1 : 0;
-  const message = em.subarray(sep + 1);
-  if (expectedLength !== undefined) good &= message.length === expectedLength ? 1 : 0;
-  return good ? Buffer.from(message) : undefined;
+  const c = Buffer.alloc(Math.max(secret.length, ciphertext.length));
+  c.set(ciphertext, c.length - ciphertext.length);
+  return nodeCrypto.createHmac("sha256", secret.hash).update(c).digest();
+}
+
+/** HMAC-SHA256 counter-mode PRF of draft-irtf-cfrg-rsa-guidance. @internal */
+export function rsaPrf(kdk: Buffer, label: string, length: number): Buffer {
+  const out = Buffer.alloc(length);
+  const bits = Buffer.alloc(2);
+  bits.writeUInt16BE((length * 8) & 0xffff);
+  for (let pos = 0, i = 0; pos < length; pos += 32, i++) {
+    const counter = Buffer.alloc(2);
+    counter.writeUInt16BE(i);
+    nodeCrypto.createHmac("sha256", kdk).update(counter).update(label).update(bits).digest().copy(out, pos);
+  }
+  return out;
+}
+
+// Branch-free helpers over small non-negative integers (< 2^31). Bits are 0 or 1.
+const ctEq = (a: number, b: number): number => (((a ^ b) - 1) >>> 31) & 1;
+const ctLt = (a: number, b: number): number => ((a - b) >>> 31) & 1;
+const ctSelect = (bit: number, a: number, b: number): number => b ^ ((a ^ b) & -bit);
+
+/**
+ * Decode EM = 0x00 || 0x02 || PS || 0x00 || M (|PS| >= 8) with implicit rejection: on malformed
+ * padding, return a synthetic message whose length and content are derived from `kdk`. The work
+ * done does not depend on the padding.
+ * @internal
+ */
+export function pkcs1v15DecodeImplicit(em: Uint8Array, kdk: Buffer): Buffer {
+  const k = em.length;
+  const maxSepOffset = k - 2 - 8;
+  const candidates = rsaPrf(kdk, "length", 256);
+  const synthetic = rsaPrf(kdk, "message", k);
+
+  let lengthMask = maxSepOffset;
+  lengthMask |= lengthMask >> 1;
+  lengthMask |= lengthMask >> 2;
+  lengthMask |= lengthMask >> 4;
+  lengthMask |= lengthMask >> 8;
+  let syntheticLength = 0;
+  for (let i = 0; i < candidates.length; i += 2) {
+    const candidate = ((candidates[i]! << 8) | candidates[i + 1]!) & lengthMask;
+    syntheticLength = ctSelect(ctLt(candidate, maxSepOffset), candidate, syntheticLength);
+  }
+
+  let good = ctEq(em[0]!, 0) & ctEq(em[1]!, 2);
+  let zeroIndex = 0;
+  let found = 0;
+  for (let i = 2; i < k; i++) {
+    const isZero = ctEq(em[i]!, 0);
+    zeroIndex = ctSelect(isZero & (found ^ 1), i, zeroIndex);
+    found |= isZero;
+  }
+  good &= found & (ctLt(zeroIndex, 2 + 8) ^ 1);
+
+  const out = Buffer.alloc(k);
+  for (let i = 0; i < k; i++) out[i] = ctSelect(good, em[i]!, synthetic[i]!);
+  return out.subarray(ctSelect(good, zeroIndex + 1, k - syntheticLength));
 }
 
 // ---------------------------------------------------------------------------

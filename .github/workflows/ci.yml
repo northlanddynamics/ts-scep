@@ -21,8 +21,27 @@ jobs:
       - run: npm run build
       - run: npm test
 
+  bun:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - run: npm ci
+      - run: npm run typecheck
+      # vitest's workers run inside Bun, so the SDK exercises Bun's node:crypto and Bun.serve.
+      - run: npm run test:bun
+
   interop:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        runtime: [node, bun]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -42,8 +61,13 @@ jobs:
         run: |
           git clone --depth 1 https://github.com/micromdm/scep.git "$RUNNER_TEMP/micromdm-scep"
           (cd "$RUNNER_TEMP/micromdm-scep" && go build -o "$RUNNER_TEMP/scepserver" ./cmd/scepserver)
+      - if: matrix.runtime == 'bun'
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
       - run: npm ci
-      - run: npm test
+      # sscep uses RSAES-PKCS1-v1_5, which Bun decrypts via the SDK's implicit-rejection fallback.
+      - run: npm run ${{ matrix.runtime == 'bun' && 'test:bun' || 'test' }}
         env:
           SSCEP_BIN: ${{ runner.temp }}/sscep-build/sscep
           SCEPSERVER_BIN: ${{ runner.temp }}/scepserver

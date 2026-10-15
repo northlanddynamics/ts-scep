@@ -3,7 +3,7 @@
  * PKIOperation, delegating authorisation and issuance decisions to a {@link ScepHandler}.
  *
  * The server is framework-agnostic: use {@link ScepServer.handle} with any HTTP stack,
- * {@link ScepServer.fetchHandler} with Fetch-API runtimes, or {@link ScepServer.nodeHandler}
+ * {@link ScepServer.fetchHandler} with Fetch-API runtimes (Bun, Hono, …), or {@link ScepServer.nodeHandler}
  * with `node:http` / Express.
  */
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -117,8 +117,26 @@ export interface ScepServerOptions {
   requireOaep?: boolean;
   /** Reject requests whose signingTime differs from local time by more than this (badTime). */
   maxClockSkewMs?: number;
+  /**
+   * Largest PKIOperation POST body accepted by {@link ScepServer.fetchHandler} and
+   * {@link ScepServer.nodeHandler}, in bytes; larger requests get HTTP 413. Default 1 MiB.
+   */
+  maxBodyBytes?: number;
   handler: ScepHandler;
 }
+
+/** Options for {@link ScepServer.handleFetch}. */
+export interface ScepFetchOptions {
+  /**
+   * The request body, if middleware has already read it (for example Hono's `c.req.arrayBuffer()`),
+   * which leaves `request.body` unusable.
+   */
+  body?: BytesLike;
+  /** Overrides {@link ScepServerOptions.maxBodyBytes} for this request. */
+  maxBodyBytes?: number;
+}
+
+const DEFAULT_MAX_BODY_BYTES = 1024 * 1024;
 
 /** Transport-neutral HTTP request. */
 export interface ScepHttpRequest {
@@ -210,20 +228,31 @@ export class ScepServer {
     }
   }
 
-  /** Fetch-API adapter (Deno, Bun, Cloudflare Workers, Next.js route handlers, Hono…). */
-  fetchHandler = async (request: Request): Promise<Response> => {
+  /**
+   * Fetch-API handler (Bun, Deno, Hono, Next.js route handlers, …). Bound, so it can be passed
+   * directly: `Bun.serve({ fetch: scep.fetchHandler })` or `app.all(path, (c) => scep.fetchHandler(c.req.raw))`.
+   */
+  fetchHandler = (request: Request): Promise<Response> => this.handleFetch(request);
+
+  /** Like {@link fetchHandler}, with per-request options such as a body already read by middleware. */
+  async handleFetch(request: Request, opts: ScepFetchOptions = {}): Promise<Response> {
+    const limit = opts.maxBodyBytes ?? this.options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
+    let body: Uint8Array | undefined;
+    if (request.method.toUpperCase() === "POST") {
+      body = opts.body !== undefined ? toBuffer(opts.body) : await readBody(request, limit);
+      if (!body || body.length > limit) return new Response(null, { status: 413 });
+    }
     const url = new URL(request.url);
-    const body = request.method === "POST" ? new Uint8Array(await request.arrayBuffer()) : undefined;
     const res = await this.handle({ method: request.method, query: url.searchParams, body });
     return new Response(res.body, { status: res.status, headers: res.headers });
-  };
+  }
 
   /**
    * `node:http` / Express adapter. Mount it at the SCEP path. Works with a raw request stream
    * or with a body already read into a Buffer by middleware such as `express.raw()`.
    */
   nodeHandler(opts: { maxBodyBytes?: number } = {}): (req: IncomingMessage, res: ServerResponse) => void {
-    const limit = opts.maxBodyBytes ?? 1024 * 1024;
+    const limit = opts.maxBodyBytes ?? this.options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
     return (req, res) => {
       const dispatch = (body: Buffer) => {
         const url = new URL(req.url ?? "/", "http://localhost");
@@ -407,6 +436,27 @@ export class ScepServer {
 
 function notSupported(): ScepResult {
   return { status: "failure", failInfo: FailInfo.badRequest, failInfoText: "Operation not supported" };
+}
+
+/** Read a request body, giving up (undefined) once it exceeds `limit` bytes. */
+async function readBody(request: Request, limit: number): Promise<Uint8Array | undefined> {
+  const declared = Number(request.headers.get("content-length") ?? NaN);
+  if (declared > limit) return undefined;
+  if (!request.body) return new Uint8Array();
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > limit) {
+      await reader.cancel().catch(() => {});
+      return undefined;
+    }
+    chunks.push(value);
+  }
+  return Buffer.concat(chunks, size);
 }
 
 function respond(status: number, contentType: string, body: Buffer): ScepHttpResponse {
